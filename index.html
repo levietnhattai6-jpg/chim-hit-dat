@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chim trên đầu – Game điều khiển bằng đầu</title>
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:#111;font-family:"Segoe UI",Arial,sans-serif;overflow:hidden}
+#stage{position:relative;width:100vw;height:100vh;background:#222;overflow:hidden}
+#stage:fullscreen{width:100%;height:100%}
+video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;transform:scaleX(-1)}
+canvas{position:absolute;inset:0;width:100%;height:100%}
+.panel{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;text-align:center;color:#fff;padding:20px;pointer-events:none}
+.panel>*{pointer-events:auto}
+.card{background:rgba(20,30,40,.78);backdrop-filter:blur(4px);border-radius:20px;padding:26px 34px;max-width:min(92vw,520px);box-shadow:0 10px 40px rgba(0,0,0,.4)}
+h1{margin:0 0 6px;font-size:clamp(26px,5vw,44px);color:#ffe14d;text-shadow:0 3px 0 #b36b00}
+p{margin:6px 0;font-size:clamp(15px,2.2vw,19px)}
+.err{color:#ff9a9a;font-weight:600}
+button{font:700 clamp(18px,2.6vw,24px) inherit;font-family:inherit;color:#fff;background:linear-gradient(#26d63a,#0a9a1e);border:3px solid #066b14;border-radius:14px;padding:12px 30px;cursor:pointer;box-shadow:0 5px 0 #066b14;transition:transform .08s}
+button:hover{transform:translateY(-1px)}
+button:active{transform:translateY(4px);box-shadow:0 1px 0 #066b14}
+button:disabled{filter:grayscale(1);opacity:.6;cursor:not-allowed}
+#fs{position:absolute;right:12px;top:12px;z-index:5;font-size:18px;padding:6px 12px;background:rgba(0,0,0,.45);border:2px solid #fff;box-shadow:none;border-radius:10px}
+.hidden{display:none!important}
+#bar{position:absolute;left:0;right:0;bottom:16px;display:flex;justify-content:center;pointer-events:none}
+#bar button{pointer-events:auto}
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="cam" playsinline muted></video>
+  <canvas id="cv"></canvas>
+  <button id="fs" title="Toàn màn hình">⛶</button>
+
+  <div id="intro" class="panel">
+    <div class="card">
+      <h1>🐤 Chim Trên Đầu</h1>
+      <p>Chim đậu trên đầu bạn. Hãy <b>vào tư thế hít đất</b> trước camera, rồi di chuyển đầu để đưa chim qua các đường ống!</p><p style="font-size:14px;opacity:.85">Đặt camera thấp, nhìn chính diện, thấy rõ mặt, vai, khuỷu tay và bàn tay. Nếu ngừng hít đất, game sẽ tạm dừng.</p>
+      <p style="font-size:14px;opacity:.8">Camera được xử lý ngay trên máy bạn, không tải lên máy chủ.</p>
+      <p id="msg" class="err"></p>
+      <button id="camBtn">Bật camera</button>
+    </div>
+  </div>
+
+  <div id="bar" class="hidden"><button id="startBtn" disabled>Bắt đầu</button></div>
+
+  <div id="over" class="panel hidden">
+    <div class="card">
+      <h1 style="color:#ff7a5a;text-shadow:0 3px 0 #7a2410">Thua rồi!</h1>
+      <p>Điểm của bạn: <b id="sc" style="font-size:1.6em;color:#ffe14d">0</b></p>
+      <p>Điểm cao nhất: <b id="bs">0</b></p>
+      <button id="again">Chơi lại</button>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+const $ = id => document.getElementById(id);
+const video = $("cam"), cv = $("cv"), ctx = cv.getContext("2d");
+const stage = $("stage");
+const VER = "0.10.14";
+const WASM = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${VER}/wasm`;
+const MODEL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
+const POSE_MODEL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
+// Ngưỡng nhận diện tư thế hít đất (chỉnh tại đây nếu cần)
+const PUSH = { minVis:0.4, wristBelow:0.2, handSpread:1.0, torsoMax:1.2, down:100, up:150, grace:500 };
+
+let W = 0, H = 0, dpr = 1;
+function resize(){
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  W = stage.clientWidth; H = stage.clientHeight;
+  cv.width = W * dpr; cv.height = H * dpr;
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+}
+addEventListener("resize", resize); resize();
+$("fs").onclick = () => document.fullscreenElement ? document.exitFullscreen() : stage.requestFullscreen?.();
+
+// ---------- Trạng thái ----------
+let landmarker = null, poser = null, state = "intro"; // intro | ready | countdown | playing | paused | over
+let best = +(localStorage.getItem("chimTrenDauBest") || 0);
+let score = 0, pipes = [], spawnT = 0, cd = 0, shake = 0, t = 0;
+let particles = [], pops = [], lastY = 0.5;
+const push = { ok:false, lastOkT:-1e9, info:"Chưa thấy hai tay", pts:null, reps:0, phase:"up", ang:180 };
+const face = { has:false, x:0, y:0, ang:0, seen:0 };
+const bird = { x:0, y:0, a:0, init:false };
+const R = () => H * 0.075;   // bán kính hiển thị của chim
+
+// ---------- Khởi động camera + model ----------
+$("camBtn").onclick = async () => {
+  const msg = $("msg"); msg.textContent = ""; $("camBtn").disabled = true;
+  $("camBtn").textContent = "Đang tải...";
+  try {
+    if (!navigator.mediaDevices?.getUserMedia) throw new Error("NOCAM_API");
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ video:{ facingMode:"user", width:{ideal:1280}, height:{ideal:720} }, audio:false });
+    } catch (e) { throw new Error("DENIED"); }
+    video.srcObject = stream; await video.play();
+    try {
+      const { FaceLandmarker, PoseLandmarker, FilesetResolver } = await import(`https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${VER}/vision_bundle.mjs`);
+      const fileset = await FilesetResolver.forVisionTasks(WASM);
+      const opts = d => ({ baseOptions:{ modelAssetPath:MODEL, delegate:d }, runningMode:"VIDEO", numFaces:1 });
+      try { landmarker = await FaceLandmarker.createFromOptions(fileset, opts("GPU")); }
+      catch { landmarker = await FaceLandmarker.createFromOptions(fileset, opts("CPU")); }
+      const popts = d => ({ baseOptions:{ modelAssetPath:POSE_MODEL, delegate:d }, runningMode:"VIDEO", numPoses:1 });
+      try { poser = await PoseLandmarker.createFromOptions(fileset, popts("GPU")); }
+      catch { poser = await PoseLandmarker.createFromOptions(fileset, popts("CPU")); }
+    } catch (e) { console.error(e); throw new Error("LIB"); }
+    $("intro").classList.add("hidden"); $("bar").classList.remove("hidden");
+    state = "ready";
+  } catch (e) {
+    $("camBtn").disabled = false; $("camBtn").textContent = "Bật camera";
+    msg.textContent = e.message === "DENIED" ? "Camera bị từ chối hoặc không có camera. Hãy cho phép truy cập camera trong trình duyệt rồi thử lại."
+      : e.message === "LIB" ? "Không tải được thư viện nhận diện khuôn mặt. Kiểm tra kết nối mạng rồi thử lại."
+      : "Trình duyệt không hỗ trợ camera (cần mở qua https hoặc http://localhost).";
+  }
+};
+$("startBtn").onclick = () => { if (face.has && push.ok) startRound(); };
+$("again").onclick = () => { $("over").classList.add("hidden"); $("bar").classList.remove("hidden"); state = "ready"; };
+
+function startRound(){
+  score = 0; pipes = []; particles = []; pops = []; spawnT = -1.8; lastY = 0.5; push.reps = 0;
+  $("bar").classList.add("hidden"); cd = 3; state = "countdown";
+}
+
+// ---------- Nhận diện + ánh xạ tọa độ (có xử lý object-fit: cover & gương) ----------
+let lastVT = -1, lastPT = -1;
+// Nhận diện tư thế hít đất từ vai – khuỷu tay – cổ tay (nhìn chính diện từ webcam)
+function analyzePush(pl, now){
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const sc = Math.max(W / vw, H / vh), ox = (W - vw * sc) / 2, oy = (H - vh * sc) / 2;
+  const m = i => ({ x: ox + (1 - pl[i].x) * vw * sc, y: oy + pl[i].y * vh * sc, v: pl[i].visibility ?? 1 });
+  const ls = m(11), rs = m(12), le = m(13), re = m(14), lw = m(15), rw = m(16);
+  push.pts = { ls, rs, le, re, lw, rw };
+  const arm = [ls, rs, le, re, lw, rw];
+  if (!arm.every(p => p.v > PUSH.minVis)) { push.info = "Chưa thấy đủ vai, khuỷu tay và bàn tay"; return; }
+  const sw = Math.abs(ls.x - rs.x);
+  if (sw < 20) { push.info = "Hãy quay chính diện về camera"; return; }
+  const shY = (ls.y + rs.y) / 2;
+  if (lw.y < shY + PUSH.wristBelow * sw || rw.y < shY + PUSH.wristBelow * sw) { push.info = "Chống hai tay xuống sàn"; return; }
+  if (Math.abs(lw.x - ls.x) > PUSH.handSpread * sw || Math.abs(rw.x - rs.x) > PUSH.handSpread * sw) { push.info = "Đặt tay dưới vai"; return; }
+  if (pl[23].visibility > 0.5 && pl[24].visibility > 0.5) {
+    const hipY = (m(23).y + m(24).y) / 2;
+    if (hipY - shY > PUSH.torsoMax * sw) { push.info = "Bạn đang đứng – hãy vào tư thế hít đất"; return; }
+  }
+  push.info = "Đúng tư thế hít đất";
+  push.lastOkT = now;
+  // góc khuỷu tay → đếm số lần hít đất
+  const ang = (s, e, w) => { const a = Math.atan2(s.y - e.y, s.x - e.x), b = Math.atan2(w.y - e.y, w.x - e.x); let d = Math.abs(a - b) * 180 / Math.PI; return d > 180 ? 360 - d : d; };
+  push.ang = (ang(ls, le, lw) + ang(rs, re, rw)) / 2;
+  if (push.ang < PUSH.down && push.phase === "up") push.phase = "down";
+  else if (push.ang > PUSH.up && push.phase === "down") { push.phase = "up"; if (state === "playing") push.reps++; }
+}
+function detect(now, dt){
+  if (!landmarker || video.readyState < 2) return;
+  if (video.currentTime !== lastVT) {
+    lastVT = video.currentTime;
+    const res = landmarker.detectForVideo(video, now);
+    const lm = res.faceLandmarks?.[0];
+    if (lm) {
+      const vw = video.videoWidth, vh = video.videoHeight;
+      const sc = Math.max(W / vw, H / vh);
+      const ox = (W - vw * sc) / 2, oy = (H - vh * sc) / 2;
+      const map = p => ({ x: ox + (1 - p.x) * vw * sc, y: oy + p.y * vh * sc });
+      const top = map(lm[10]), chin = map(lm[152]);
+      const l = map(lm[234]), r = map(lm[454]);
+      // vectơ "lên" của đầu (từ cằm tới đỉnh), nghiêng theo
+      let ux = top.x - chin.x, uy = top.y - chin.y; const len = Math.hypot(ux, uy) || 1; ux /= len; uy /= len;
+      const R0 = R();
+      const tx = top.x + ux * R0 * 0.75, ty = top.y + uy * R0 * 0.75 - R0 * 0.1;
+      face.ang = Math.atan2(ux, -uy) * 0.9;   // 0 khi đầu thẳng
+      face.x = tx; face.y = ty; face.has = true; face.seen = now;
+    }
+  }
+  if (now - face.seen > 350) face.has = false;
+  // làm mượt thích ứng: chậm thì mượt, nhanh thì bám sát
+  if (face.has) {
+    if (!bird.init) { bird.x = face.x; bird.y = face.y; bird.a = face.ang; bird.init = true; }
+    else {
+      const d = Math.hypot(face.x - bird.x, face.y - bird.y);
+      const k = 9 + Math.min(35, (d / Math.max(dt, .001)) / H * 25);
+      const f = 1 - Math.exp(-k * dt);
+      bird.x += (face.x - bird.x) * f; bird.y += (face.y - bird.y) * f;
+      bird.a += (face.ang - bird.a) * (1 - Math.exp(-12 * dt));
+    }
+  }
+  if (poser && video.currentTime !== lastPT && video.readyState >= 2) {
+    lastPT = video.currentTime;
+    const pl = poser.detectForVideo(video, now).landmarks?.[0];
+    if (pl) analyzePush(pl, now); else { push.pts = null; push.info = "Chưa thấy hai tay"; }
+  }
+  push.ok = now - push.lastOkT < PUSH.grace;
+  $("startBtn").disabled = !(face.has && push.ok);
+}
+
+// ---------- Ống ----------
+const diff = () => Math.min(score / 25, 1);
+const pw = () => Math.max(56, Math.min(W * 0.075, 120));
+const speed = () => W * (0.17 + 0.15 * diff());
+const gapSize = () => H * (0.46 - 0.15 * diff());
+const interval = () => 2.5 - 0.9 * diff();     // giây giữa 2 cặp ống
+
+function spawn(){
+  const g = gapSize();
+  const lo = Math.max(0.30, (g / 2 + H * 0.04) / H), hi = Math.min(0.70, 1 - lo);
+  // giới hạn độ chênh giữa hai khe liên tiếp để kịp di chuyển đầu
+  const maxD = Math.min(0.34, 0.14 + interval() * 0.07);
+  const a = Math.max(lo, lastY - maxD), b = Math.min(hi, lastY + maxD);
+  const c = a + Math.random() * (b - a);
+  lastY = c;
+  pipes.push({ x: W + 10, cy: c * H, gap: g, scored: false });
+}
+
+function circleRect(cx, cy, r, x, y, w, h){
+  const nx = Math.max(x, Math.min(cx, x + w)), ny = Math.max(y, Math.min(cy, y + h));
+  return (cx - nx) ** 2 + (cy - ny) ** 2 < r * r;
+}
+function hit(p){
+  const w = pw(), capH = w * 0.45, capW = w * 1.18, ce = (capW - w) / 2;
+  const gt = p.cy - p.gap / 2, gb = p.cy + p.gap / 2, r = R() * 0.62;
+  return circleRect(bird.x, bird.y, r, p.x, -5, w, gt - capH + 5) ||
+         circleRect(bird.x, bird.y, r, p.x - ce, gt - capH, capW, capH) ||
+         circleRect(bird.x, bird.y, r, p.x - ce, gb, capW, capH) ||
+         circleRect(bird.x, bird.y, r, p.x, gb + capH, w, H);
+}
+
+function update(dt){
+  if (state === "countdown") {
+    if (!face.has || !push.ok) { state = "paused"; return; }
+    cd -= dt; if (cd <= 0) state = "playing";
+    return;
+  }
+  if (state !== "playing") return;
+  if (!face.has || !push.ok) { state = "paused"; return; }
+  spawnT += dt;
+  if (spawnT >= interval() || (pipes.length === 0 && spawnT >= 0)) { spawn(); spawnT = pipes.length === 1 && score === 0 ? 0 : 0; }
+  const v = speed(), w = pw();
+  for (const p of pipes) {
+    p.x -= v * dt;
+    if (!p.scored && p.x + w < bird.x - R() * 0.6) {
+      p.scored = true; score++;
+      pops.push({ x: bird.x, y: bird.y - R() * 1.4, t: 0 });
+      for (let i = 0; i < 10; i++) particles.push({ x: bird.x, y: bird.y, vx: (Math.random() - .5) * 300, vy: -Math.random() * 260, life: .7, c: "#ffe14d", s: 5 });
+    }
+    if (hit(p)) return gameOver();
+  }
+  pipes = pipes.filter(p => p.x + w * 1.3 > 0);
+}
+
+function gameOver(){
+  state = "over"; shake = 0.5;
+  for (let i = 0; i < 24; i++) particles.push({ x: bird.x, y: bird.y, vx: (Math.random() - .5) * 600, vy: (Math.random() - .7) * 500, life: 1, c: i % 2 ? "#4aa3e8" : "#ffe14d", s: 6 });
+  if (score > best) { best = score; localStorage.setItem("chimTrenDauBest", best); }
+  $("sc").textContent = score; $("bs").textContent = best;
+  setTimeout(() => $("over").classList.remove("hidden"), 700);
+}
+
+// ---------- Vẽ ----------
+function drawPipe(p){
+  const w = pw(), capH = w * 0.45, capW = w * 1.18, ce = (capW - w) / 2;
+  const gt = p.cy - p.gap / 2, gb = p.cy + p.gap / 2;
+  const body = (x, y, ww, hh) => {
+    const g = ctx.createLinearGradient(x, 0, x + ww, 0);
+    g.addColorStop(0, "#007a0c"); g.addColorStop(.12, "#00b31a"); g.addColorStop(.7, "#00d41f"); g.addColorStop(.85, "#17e63a"); g.addColorStop(1, "#009a14");
+    ctx.fillStyle = g; ctx.fillRect(x, y, ww, hh);
+    ctx.lineWidth = 4; ctx.strokeStyle = "#006400"; ctx.strokeRect(x, y, ww, hh);
+  };
+  body(p.x, -10, w, gt - capH + 10); body(p.x - ce, gt - capH, capW, capH);
+  body(p.x - ce, gb, capW, capH); body(p.x, gb + capH, w, H - gb - capH + 10);
+}
+
+function drawBird(x, y, ang, r, flap){
+  ctx.save(); ctx.translate(x, y); ctx.rotate(ang);
+  const s = r / 50; ctx.scale(s, s);
+  const wing = side => {
+    ctx.save(); ctx.scale(side, 1); ctx.translate(34, -8); ctx.rotate(-0.5 - flap * 0.7);
+    const g = ctx.createLinearGradient(0, 0, 40, -10); g.addColorStop(0, "#3d8fd8"); g.addColorStop(1, "#8cd0f5");
+    ctx.fillStyle = g; ctx.strokeStyle = "#1f5f9c"; ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.moveTo(0, 8); ctx.quadraticCurveTo(22, -26, 52, -14); ctx.quadraticCurveTo(40, -4, 46, 6);
+    ctx.quadraticCurveTo(30, 2, 34, 14); ctx.quadraticCurveTo(18, 12, 0, 22); ctx.closePath(); ctx.fill(); ctx.stroke(); ctx.restore();
+  };
+  wing(1); wing(-1);
+  // chân
+  ctx.strokeStyle = "#e8741a"; ctx.lineWidth = 4; ctx.lineCap = "round";
+  for (const dx of [-12, 12]) { ctx.beginPath(); ctx.moveTo(dx, 38); ctx.lineTo(dx, 50); ctx.moveTo(dx, 50); ctx.lineTo(dx - 7, 55); ctx.moveTo(dx, 50); ctx.lineTo(dx + 7, 55); ctx.stroke(); }
+  // chỏm lông
+  ctx.fillStyle = "#3d8fd8"; ctx.beginPath(); ctx.moveTo(-8, -40); ctx.quadraticCurveTo(-6, -62, 2, -56); ctx.quadraticCurveTo(6, -66, 12, -52); ctx.quadraticCurveTo(10, -44, 6, -40); ctx.fill();
+  // thân
+  const bg = ctx.createRadialGradient(-10, -20, 5, 0, 0, 48); bg.addColorStop(0, "#7cc4f2"); bg.addColorStop(1, "#2f86d0");
+  ctx.fillStyle = bg; ctx.strokeStyle = "#1f5f9c"; ctx.lineWidth = 2.5;
+  ctx.beginPath(); ctx.ellipse(0, 0, 44, 42, 0, 0, 7); ctx.fill(); ctx.stroke();
+  const yg = ctx.createLinearGradient(0, 8, 0, 42); yg.addColorStop(0, "#ffe14d"); yg.addColorStop(1, "#f5b800");
+  ctx.fillStyle = yg; ctx.beginPath(); ctx.ellipse(0, 20, 28, 22, 0, 0, 7); ctx.fill();
+  // má hồng
+  ctx.fillStyle = "rgba(255,120,140,.65)"; for (const dx of [-28, 28]) { ctx.beginPath(); ctx.ellipse(dx, 6, 8, 5, 0, 0, 7); ctx.fill(); }
+  // mắt
+  for (const dx of [-15, 15]) {
+    ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(dx, -10, 9, 0, 7); ctx.fill();
+    ctx.fillStyle = "#e8901a"; ctx.beginPath(); ctx.arc(dx, -9, 6.5, 0, 7); ctx.fill();
+    ctx.fillStyle = "#3a1f0a"; ctx.beginPath(); ctx.arc(dx, -9, 3.6, 0, 7); ctx.fill();
+    ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(dx - 2, -12, 1.8, 0, 7); ctx.fill();
+  }
+  // mỏ
+  ctx.fillStyle = "#ff8a1a"; ctx.strokeStyle = "#b8560a"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(-8, 4); ctx.quadraticCurveTo(0, 0, 8, 4); ctx.quadraticCurveTo(0, 18, -8, 4); ctx.fill(); ctx.stroke();
+  ctx.restore();
+}
+
+function text(str, x, y, size, color = "#fff", stroke = "#000"){
+  ctx.font = `800 ${size}px "Segoe UI",Arial,sans-serif`; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.lineWidth = size * 0.14; ctx.lineJoin = "round"; ctx.strokeStyle = stroke; ctx.strokeText(str, x, y);
+  ctx.fillStyle = color; ctx.fillText(str, x, y);
+}
+
+function draw(dt){
+  ctx.clearRect(0, 0, W, H);
+  ctx.save();
+  if (shake > 0) { shake -= dt; ctx.translate((Math.random() - .5) * 18 * shake, (Math.random() - .5) * 18 * shake); }
+  pipes.forEach(drawPipe);
+  const showBird = bird.init && state !== "intro" && (state !== "over" || shake > 0.3 || true);
+  if (showBird && !(state === "over" && shake <= 0 && false)) {
+    const flap = Math.sin(t * 22);
+    drawBird(bird.x, bird.y, bird.a, R(), state === "paused" ? 0 : flap);
+  }
+  for (const p of particles) { p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 700 * dt; p.life -= dt; ctx.globalAlpha = Math.max(0, p.life); ctx.fillStyle = p.c; ctx.fillRect(p.x, p.y, p.s, p.s); }
+  ctx.globalAlpha = 1; particles = particles.filter(p => p.life > 0);
+  for (const p of pops) { p.t += dt; const k = p.t / 0.8; ctx.globalAlpha = 1 - k; text("+1", p.x, p.y - k * 60, R() * 0.8, "#ffe14d", "#7a4a00"); }
+  ctx.globalAlpha = 1; pops = pops.filter(p => p.t < .8);
+  ctx.restore();
+
+  if (push.pts && state !== "intro") {
+    const P = push.pts, col = push.ok ? "#27e04a" : "#ff5a5a";
+    ctx.lineCap = "round"; ctx.lineWidth = Math.max(4, H * 0.008); ctx.strokeStyle = col;
+    for (const [s, e, w] of [[P.ls, P.le, P.lw], [P.rs, P.re, P.rw]]) {
+      ctx.beginPath(); ctx.moveTo(s.x, s.y); ctx.lineTo(e.x, e.y); ctx.lineTo(w.x, w.y); ctx.stroke();
+      ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(e.x, e.y, Math.max(8, H * 0.016), 0, 7); ctx.fill(); ctx.stroke();
+    }
+  }
+  if (state !== "intro") {
+    const fs = Math.min(H * 0.04, 28);
+    text("Hít đất: " + push.reps, fs * 3.2, H - fs * 1.6, fs, "#fff", "#000");
+  }
+  if (state === "playing" || state === "countdown" || state === "paused" || state === "over") {
+    const sz = Math.min(H * 0.11, 90);
+    text(String(score), W / 2, sz * 0.85, sz, "#fff", "#1b4d1b");
+    text("Cao nhất: " + best, W / 2, sz * 1.65, sz * 0.26, "#ffe14d", "#000");
+  }
+  if (state === "ready") {
+    ctx.fillStyle = "rgba(0,0,0,.35)"; ctx.fillRect(0, 0, W, H * 0.16);
+    text(!face.has ? "Hãy đưa khuôn mặt vào khung hình" : !push.ok ? "Vào tư thế hít đất để chơi: " + push.info : "Sẵn sàng! Di chuyển đầu để đưa chim qua các đường ống!", W / 2, H * 0.08, Math.min(W * 0.04, 30));
+  }
+  if (state === "countdown") text(String(Math.ceil(cd)), W / 2, H / 2, H * 0.28, "#ffe14d", "#7a4a00");
+  if (state === "paused") {
+    ctx.fillStyle = "rgba(0,0,0,.45)"; ctx.fillRect(0, 0, W, H);
+    text(!face.has ? "Không thấy khuôn mặt" : "Hãy hít đất để chơi!", W / 2, H / 2, Math.min(W * 0.07, 60), "#ff9a9a", "#400");
+    text(!face.has ? "Nhìn vào camera để tiếp tục" : push.info, W / 2, H / 2 + Math.min(W * 0.06, 52), Math.min(W * 0.03, 26));
+  }
+}
+
+// ---------- Vòng lặp ----------
+let prev = performance.now();
+function loop(now){
+  const dt = Math.min((now - prev) / 1000, 0.05); prev = now; t += dt;
+  detect(now, dt);
+  if (state === "paused" && face.has && push.ok) { cd = 3; state = "countdown"; }  // nhận diện lại → đếm ngược
+  update(dt);
+  draw(dt);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
