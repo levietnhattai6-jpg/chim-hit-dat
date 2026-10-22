@@ -195,11 +195,14 @@ function detect(now, dt){
 }
 
 // ---------- Ống ----------
-const diff = () => Math.min(score / 25, 1);
+// Độ khó (chỉnh tại đây): đầu game ống chạy nhanh hơn rồi chậm về tốc độ thường;
+// khe hở lúc đầu rộng rồi nhỏ dần tới mức chỉ vừa đủ chim lọt qua.
+const DIFF = { baseSpeed:0.17, boostSpeed:0.08, boostPipes:6, gapStart:0.56, gapEnd:0.19, gapPipes:30 };
+const gapProg = () => Math.min(score / DIFF.gapPipes, 1);
 const pw = () => Math.max(56, Math.min(W * 0.075, 120));
-const speed = () => W * (0.17 + 0.15 * diff());
-const gapSize = () => H * (0.46 - 0.15 * diff());
-const interval = () => 2.5 - 0.9 * diff();     // giây giữa 2 cặp ống
+const speed = () => W * (DIFF.baseSpeed + DIFF.boostSpeed * Math.max(0, 1 - score / DIFF.boostPipes));
+const gapSize = () => H * (DIFF.gapStart + (DIFF.gapEnd - DIFF.gapStart) * gapProg());
+const interval = () => 2.4 - 0.4 * gapProg();     // giây giữa 2 cặp ống
 
 function spawn(){
   const g = gapSize();
